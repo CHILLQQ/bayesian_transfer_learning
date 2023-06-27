@@ -1,7 +1,7 @@
 '''Train CIFAR10 with PyTorch.'''
 from __future__ import print_function
 import sys
-sys.path.append('..')
+sys.path.append('./')
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,6 +22,7 @@ import pandas as pd
 from torch.autograd import Variable
 import numpy as np
 import random
+from losses import GaussianPriorCELossShifted
 
 parser = argparse.ArgumentParser(description='cSG-MCMC CIFAR10 Training')
 parser.add_argument('--dir', type=str, default=None, required=True, help='path to save checkpoints (default: None)')
@@ -41,7 +42,7 @@ parser.add_argument('--temperature', type=float, default=1./50000,
 
 args = parser.parse_args()
 device_id = args.device_id
-use_cuda = torch.cuda.is_available()
+#use_cuda = torch.cuda.is_available()
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 random.seed(args.seed)
@@ -79,29 +80,6 @@ net.fc = torch.nn.Identity()  # Get the classification head off
 net.load_state_dict(checkpoint)  # Load the pretrained backbone weights
 net.fc = torch.nn.Linear(in_features=2048, out_features=10, bias=True)  # Put the proper classification head back
 
-#### Load prior parameters
-print("Loading prior parameters")
-means = torch.load(path + '_mean.pt')
-variance = torch.load(path + '_variance.pt')
-cov_factor = torch.load(path + '_covmat.pt')
-print("Loaded")
-print("Parameter space dimension:", means.shape)
-prior_scale = 1e10 # default from "pretrain your loss"
-prior_eps = 1e-1 # default from "pretrain your loss"
-### scale the variance
-variance = prior_scale * variance + prior_eps
-
-number_of_samples_prior = 5 # default from "pretrain your loss"
-### scale the low rank covariance
-cov_mat_sqr = prior_scale * (cov_factor[:number_of_samples_prior])
-
-
-###### Prior logpdf
-from torch.distributions.lowrank_multivariate_normal import LowRankMultivariateNormal
-mvn = LowRankMultivariateNormal(means, cov_mat_sqr.t(), variance)
-
-
-
 
 use_mps = True
 mps_device = torch.device("mps")
@@ -109,6 +87,33 @@ if use_mps:
     net.to(mps_device)
     cudnn.benchmark = True
     cudnn.deterministic = True
+
+
+#### Load prior parameters
+print("Loading prior parameters")
+mean = torch.load(path + '_mean.pt')
+variance = torch.load(path + '_variance.pt')
+cov_factor = torch.load(path + '_covmat.pt')
+print("Loaded")
+print("Parameter space dimension:", mean.shape)
+prior_scale = 1e10 # default from "pretrain your loss"
+prior_eps = 1e-1 # default from "pretrain your loss"
+### scale the variance
+variance = prior_scale * variance + prior_eps
+
+number_of_samples_prior = 5 # default from "pretrain your loss"
+### scale the low rank covariance
+cov_mat_sqrt = prior_scale * (cov_factor[:number_of_samples_prior])
+prior_params = {'mean': mean.cpu(), 'variance': variance.cpu(), 'cov_mat_sqr': cov_mat_sqrt.cpu()}
+
+# ###### Prior logpdf
+# from torch.distributions.lowrank_multivariate_normal import LowRankMultivariateNormal
+# mvn = LowRankMultivariateNormal(means, cov_mat_sqr.t(), variance)
+
+
+
+
+
 
 def update_params(lr,epoch):
     for p in net.parameters():
@@ -118,7 +123,7 @@ def update_params(lr,epoch):
         d_p.add_(weight_decay, p.data)
         buf_new = (1-args.alpha)*p.buf - lr*d_p
         if (epoch%50)+1>45:
-            eps = torch.randn(p.size()).cuda(device_id)
+            eps = torch.randn(p.size()).to(mps_device)
             buf_new += (2.0*lr*args.alpha*args.temperature/datasize)**.5*eps
         p.data.add_(buf_new)
         p.buf = buf_new
@@ -152,20 +157,19 @@ def train(epoch):
         lr = adjust_learning_rate(epoch,batch_idx)
         lrs.append(lr)
         outputs = net(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        update_params(lr,epoch)
         params = torch.flatten(torch.cat([torch.flatten(p) for p in net.parameters()])) ## Flatten all the parms to one array
-        params = params[:means.shape[0]].cpu()
-        print("Number of params we have:", params.shape)
-        print("Logpdf prior of the parameters:", mvn.log_prob(params).item())
-        #print("First 10 params", params[0:10])
+        params = params[:mean.shape[0]].cpu()
+        metrices = criterion(outputs, targets.data, N=mean.shape[0], params=params)
+        #print(metrices)
+        metrices['loss'].backward()
+        update_params(lr,epoch)
 
-        train_loss += loss.data.item()
+
+        train_loss += metrices['nll'].item()
         _, predicted = torch.max(outputs.data, 1)
         total += targets.size(0)
         correct += predicted.eq(targets.data).cpu().sum()
-        if batch_idx%10==0: ## used to be 100!!
+        if batch_idx%100==0: 
             print('Loss: %.3f | Acc: %.3f%% (%d/%d)'
                 % (train_loss/(batch_idx+1), 100.*correct.item()/total, correct, total))
     return lrs
@@ -176,14 +180,16 @@ def test(epoch):
     test_loss = 0
     correct = 0
     total = 0
+    params = torch.flatten(torch.cat([torch.flatten(p) for p in net.parameters()])) ## Flatten all the parms to one array
+    params = params[:mean.shape[0]].cpu()
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(testloader):
             if use_mps:
-                inputs, targets = inputs.to(mps_device), targets.cuda(mps_device)
+                inputs, targets = inputs.to(mps_device), targets.to(mps_device)
             outputs = net(inputs)
-            loss = criterion(outputs, targets)
+            metrices = criterion(outputs, targets.data, N=mean.shape[0], params=params)
 
-            test_loss += loss.data.item()
+            test_loss += metrices['nll'].item()
             _, predicted = torch.max(outputs.data, 1)
             total += targets.size(0)
             correct += predicted.eq(targets.data).cpu().sum()
@@ -203,7 +209,9 @@ num_batch = datasize/args.batch_size+1
 lr_0 = 0.5 # initial lr
 M = 4 # number of cycles
 T = args.epochs*num_batch # total number of iterations
-criterion = nn.CrossEntropyLoss()
+#criterion = nn.CrossEntropyLoss()
+criterion = GaussianPriorCELossShifted(prior_params)
+print(criterion)
 mt = 0
 
 lrs = []
